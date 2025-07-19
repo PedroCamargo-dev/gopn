@@ -26,14 +26,8 @@ type Options struct {
 var sessionPathRegex = regexp.MustCompile(`/net/openvpn/v3/sessions/[a-f0-9\-]+`)
 
 func Connect(ctx context.Context, opt Options) error {
-	if opt.ConfigPath == "" {
-		return errors.New("config ovpn não especificada")
-	}
-	if opt.Username == "" {
-		return errors.New("username vazio")
-	}
-	if opt.AuthSecret == "" {
-		return errors.New("authSecret vazio (senha [+ mfa])")
+	if err := validateOptions(opt); err != nil {
+		return err
 	}
 
 	fmt.Printf("Iniciando sessão VPN usando: %s\n", opt.ConfigPath)
@@ -41,29 +35,11 @@ func Connect(ctx context.Context, opt Options) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		select {
-		case <-sigCh:
-			fmt.Println("\nCancelando conexão (Ctrl+C recebido)...")
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
+	handleSignals(ctx, cancel)
 
-	cmd := exec.CommandContext(ctx, "openvpn3", "session-start", "--config", opt.ConfigPath)
-	stdin, err := cmd.StdinPipe()
+	cmd, stdin, stdout, stderr, err := setupCommand(ctx, opt.ConfigPath)
 	if err != nil {
-		return fmt.Errorf("stdin pipe: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("stderr pipe: %w", err)
+		return err
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -71,84 +47,18 @@ func Connect(ctx context.Context, opt Options) error {
 	}
 
 	outputReader := io.MultiReader(stdout, stderr)
-
-	const windowMax = 512
-	window := make([]byte, 0, windowMax)
-
-	injectedUser := false
-	injectedPass := false
-
 	doneCh := make(chan error, 1)
 
-	go func() {
-		defer stdin.Close()
-		buf := make([]byte, 256)
-		for {
-			n, rerr := outputReader.Read(buf)
-			if n > 0 {
-				chunk := buf[:n]
-				os.Stdout.Write(chunk)
-
-				if len(window)+len(chunk) > windowMax {
-
-					overflow := len(window) + len(chunk) - windowMax
-					if overflow < len(window) {
-						window = window[overflow:]
-					} else {
-						window = window[:0]
-					}
-				}
-				window = append(window, chunk...)
-				winStr := string(window)
-
-				if !injectedUser && strings.Contains(winStr, "Auth User name:") {
-					if opt.Verbose {
-						fmt.Println("[debug] Injetando username")
-					}
-					_, _ = io.WriteString(stdin, opt.Username+"\n")
-					injectedUser = true
-				}
-				if !injectedPass && strings.Contains(winStr, "Auth Password:") {
-					if opt.Verbose {
-						fmt.Println("[debug] Injetando password (senha+MFA se houver)")
-					}
-					_, _ = io.WriteString(stdin, opt.AuthSecret+"\n")
-					injectedPass = true
-				}
-			}
-			if rerr != nil {
-				if rerr != io.EOF {
-					doneCh <- rerr
-				} else {
-					doneCh <- nil
-				}
-				return
-			}
-		}
-	}()
+	go processOutput(stdin, outputReader, opt, doneCh)
 
 	if opt.Timeout > 0 {
-		var cancelTimeout context.CancelFunc
-		ctx, cancelTimeout = context.WithTimeout(ctx, opt.Timeout)
+		ctx, cancelTimeout := context.WithTimeout(ctx, opt.Timeout)
 		defer cancelTimeout()
-		go func() {
-			<-ctx.Done()
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				fmt.Println("\nTempo limite atingido — encerrando processo.")
-				_ = cmd.Process.Kill()
-			}
-		}()
+		go handleTimeout(ctx, cmd)
 	}
 
 	if err := cmd.Wait(); err != nil {
-
-		select {
-		case rerr := <-doneCh:
-			if rerr != nil {
-				fmt.Printf("Erro durante leitura de saída: %v\n", rerr)
-			}
-		default:
-		}
+		handleDoneCh(doneCh)
 		if ctx.Err() == context.Canceled {
 			return errors.New("conexão cancelada pelo usuário")
 		}
@@ -174,6 +84,124 @@ func Connect(ctx context.Context, opt Options) error {
 	zeroBytes(opt.AuthSecret)
 
 	return nil
+}
+
+func validateOptions(opt Options) error {
+	if opt.ConfigPath == "" {
+		return errors.New("config ovpn não especificada")
+	}
+	if opt.Username == "" {
+		return errors.New("username vazio")
+	}
+	if opt.AuthSecret == "" {
+		return errors.New("authSecret vazio (senha [+ mfa])")
+	}
+	return nil
+}
+
+func handleSignals(ctx context.Context, cancel context.CancelFunc) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-sigCh:
+			fmt.Println("\nCancelando conexão (Ctrl+C recebido)...")
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+}
+
+func setupCommand(ctx context.Context, configPath string) (*exec.Cmd, io.WriteCloser, io.ReadCloser, io.ReadCloser, error) {
+	cmd := exec.CommandContext(ctx, "openvpn3", "session-start", "--config", configPath)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("stderr pipe: %w", err)
+	}
+	return cmd, stdin, stdout, stderr, nil
+}
+
+func processOutput(stdin io.WriteCloser, outputReader io.Reader, opt Options, doneCh chan error) {
+	defer stdin.Close()
+	const windowMax = 512
+	window := make([]byte, 0, windowMax)
+	injectedUser := false
+	injectedPass := false
+	buf := make([]byte, 256)
+	for {
+		n, rerr := outputReader.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			os.Stdout.Write(chunk)
+			window = updateWindow(window, chunk, windowMax)
+			winStr := string(window)
+			injectedUser, injectedPass = injectCredentials(stdin, winStr, opt, injectedUser, injectedPass)
+		}
+		if rerr != nil {
+			if rerr != io.EOF {
+				doneCh <- rerr
+			} else {
+				doneCh <- nil
+			}
+			return
+		}
+	}
+}
+
+func updateWindow(window, chunk []byte, windowMax int) []byte {
+	if len(window)+len(chunk) > windowMax {
+		overflow := len(window) + len(chunk) - windowMax
+		if overflow < len(window) {
+			window = window[overflow:]
+		} else {
+			window = window[:0]
+		}
+	}
+	return append(window, chunk...)
+}
+
+func injectCredentials(stdin io.WriteCloser, winStr string, opt Options, injectedUser, injectedPass bool) (bool, bool) {
+	if !injectedUser && strings.Contains(winStr, "Username:") {
+		if opt.Verbose {
+			fmt.Println("[debug] Injetando username")
+		}
+		_, _ = io.WriteString(stdin, opt.Username+"\n")
+		injectedUser = true
+	}
+	if !injectedPass && strings.Contains(winStr, "Password:") {
+		if opt.Verbose {
+			fmt.Println("[debug] Injetando password (senha+MFA se houver)")
+		}
+		_, _ = io.WriteString(stdin, opt.AuthSecret+"\n")
+		injectedPass = true
+	}
+	return injectedUser, injectedPass
+}
+
+func handleTimeout(ctx context.Context, cmd *exec.Cmd) {
+	<-ctx.Done()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		fmt.Println("\nTempo limite atingido — encerrando processo.")
+		_ = cmd.Process.Kill()
+	}
+}
+
+func handleDoneCh(doneCh chan error) {
+	select {
+	case rerr := <-doneCh:
+		if rerr != nil {
+			fmt.Printf("Erro durante leitura de saída: %v\n", rerr)
+		}
+	default:
+	}
 }
 
 func zeroBytes(s string) {
@@ -240,25 +268,40 @@ func parseSessionPaths(output string) []string {
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	for scanner.Scan() {
 		line := scanner.Text()
+		paths = appendSessionPathsFromLine(paths, line)
+	}
+	return paths
+}
 
-		if strings.Contains(line, "/net/openvpn/v3/sessions/") {
-			matches := sessionPathRegex.FindAllString(line, -1)
-			for _, m := range matches {
-				if !contains(paths, m) {
-					paths = append(paths, m)
-				}
-			}
-		} else {
+func appendSessionPathsFromLine(paths []string, line string) []string {
+	if strings.Contains(line, "/net/openvpn/v3/sessions/") {
+		paths = appendMatches(paths, line)
+	} else if isPathLine(line) {
+		paths = appendCandidatePath(paths, line)
+	}
+	return paths
+}
 
-			if strings.HasPrefix(strings.TrimSpace(strings.ToLower(line)), "path:") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) == 2 {
-					candidate := strings.TrimSpace(parts[1])
-					if strings.HasPrefix(candidate, "/net/openvpn/v3/sessions/") && !contains(paths, candidate) {
-						paths = append(paths, candidate)
-					}
-				}
-			}
+func appendMatches(paths []string, line string) []string {
+	matches := sessionPathRegex.FindAllString(line, -1)
+	for _, m := range matches {
+		if !contains(paths, m) {
+			paths = append(paths, m)
+		}
+	}
+	return paths
+}
+
+func isPathLine(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(strings.ToLower(line)), "path:")
+}
+
+func appendCandidatePath(paths []string, line string) []string {
+	parts := strings.SplitN(line, ":", 2)
+	if len(parts) == 2 {
+		candidate := strings.TrimSpace(parts[1])
+		if strings.HasPrefix(candidate, "/net/openvpn/v3/sessions/") && !contains(paths, candidate) {
+			paths = append(paths, candidate)
 		}
 	}
 	return paths
