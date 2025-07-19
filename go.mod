@@ -1,4 +1,4 @@
-module gopn
+module github.com/PedroCamargo-dev/gopn
 
 go 1.24.5
 
