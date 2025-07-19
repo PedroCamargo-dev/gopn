@@ -6,12 +6,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"gopn/internal/config"
-	"gopn/internal/vpn"
 	"os"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/PedroCamargo-dev/gopn/internal/config"
+	"github.com/PedroCamargo-dev/gopn/internal/vpn"
 
 	"golang.org/x/term"
 )
