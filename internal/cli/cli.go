@@ -17,6 +17,8 @@ import (
 	"golang.org/x/term"
 )
 
+const errLoadConfigFmt = "Erro carregando config: %v\n"
+
 func Run() {
 	if len(os.Args) < 2 {
 		printHelp()
@@ -54,7 +56,7 @@ func handleAdd(args []string) {
 
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Printf("Erro carregando config: %v\n", err)
+		fmt.Printf(errLoadConfigFmt, err)
 		return
 	}
 
@@ -101,7 +103,7 @@ func handleConnect(args []string) {
 
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Printf("Erro carregando config: %v\n", err)
+		fmt.Printf(errLoadConfigFmt, err)
 		return
 	}
 
@@ -179,7 +181,7 @@ func handleDisconnect(args []string) {
 	profileName := args[0]
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Printf("Erro carregando config: %v\n", err)
+		fmt.Printf(errLoadConfigFmt, err)
 		return
 	}
 	prof, ok := cfg.Profiles[profileName]
@@ -209,21 +211,22 @@ func handleList() {
 }
 
 func printHelp() {
-	fmt.Println(`
-gopn - Wrapper simplificado para openvpn3
+	helpText := `
+		gopn - Wrapper simplificado para openvpn3
 
-Uso:
-  gopn <comando> [args]
+		Uso:
+			gopn <comando> [args]
 
-Comandos:
-  add <nome> <arquivo.ovpn> <usuario>   Adiciona perfil.
-  connect [flags] <nome>                Conecta usando perfil.
-  disconnect [<nome>]                   Desconecta todas as sessões ou só a do perfil.
-  list                                  Lista perfis.
-  help                                  Ajuda.
+		Comandos:
+			add <nome> <arquivo.ovpn> <usuario>   Adiciona perfil.
+			connect [flags] <nome>                Conecta usando perfil.
+			disconnect [<nome>]                   Desconecta todas as sessões ou só a do perfil.
+			list                                  Lista perfis.
+			help                                  Ajuda.
 
-Exemplos:
-  gopn disconnect           # Desconecta tudo
-  gopn disconnect corp      # Desconecta somente a sessão do perfil 'corp'
-`)
+		Exemplos:
+			gopn disconnect           # Desconecta tudo
+			gopn disconnect corp      # Desconecta somente a sessão do perfil 'corp'
+		`
+	fmt.Print(helpText)
 }
