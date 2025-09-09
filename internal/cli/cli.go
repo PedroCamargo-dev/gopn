@@ -18,7 +18,7 @@ import (
 	"golang.org/x/term"
 )
 
-const errLoadConfigFmt = "Erro carregando config: %v\n"
+const errLoadConfigFmt = "❌ Erro ao carregar configuração: %v\n"
 
 func Run() {
 	if len(os.Args) < 2 {
@@ -38,26 +38,29 @@ func Run() {
 	case "help":
 		printHelp()
 	default:
-		fmt.Printf("Comando desconhecido: %s\n", command)
+		fmt.Printf("❌ Comando desconhecido: '%s'\n", command)
+		fmt.Println("   Use 'gopn help' para ver os comandos disponíveis.")
 		printHelp()
 	}
 }
 
 func handleAdd(args []string) {
 	if len(args) != 3 {
-		fmt.Println("Uso: gopn add <nome_do_perfil> <arquivo.ovpn> <username>")
+		fmt.Println("❌ Uso: gopn add <nome_do_perfil> <arquivo.ovpn> <username>")
+		fmt.Println("   Exemplo: gopn add trabalho /home/user/empresa.ovpn joao.silva")
 		return
 	}
 	name, ovpn, user := args[0], args[1], args[2]
 
 	absOvpn, err := filepath.Abs(ovpn)
 	if err != nil {
-		fmt.Printf("Erro ao resolver caminho absoluto: %v\n", err)
+		fmt.Printf("❌ Erro ao resolver caminho absoluto: %v\n", err)
 		return
 	}
 
 	if _, err := os.Stat(absOvpn); errors.Is(err, os.ErrNotExist) {
-		fmt.Printf("Arquivo %s não encontrado.\n", absOvpn)
+		fmt.Printf("❌ Erro: O arquivo '%s' não foi encontrado.\n", absOvpn)
+		fmt.Println("   Verifique se o caminho está correto e se o arquivo existe.")
 		return
 	}
 
@@ -68,11 +71,11 @@ func handleAdd(args []string) {
 	}
 
 	if _, exists := cfg.Profiles[name]; exists {
-		fmt.Printf("Perfil '%s' já existe. Sobrescrever? (s/N): ", name)
+		fmt.Printf("⚠️  O perfil '%s' já existe. Deseja sobrescrever? (s/N): ", name)
 		var resp string
 		fmt.Scanln(&resp)
 		if !strings.EqualFold(resp, "s") {
-			fmt.Println("Cancelado.")
+			fmt.Println("❌ Operação cancelada.")
 			return
 		}
 	}
@@ -84,10 +87,12 @@ func handleAdd(args []string) {
 	}
 
 	if err := cfg.Save(); err != nil {
-		fmt.Printf("Erro salvando: %v\n", err)
+		fmt.Printf("❌ Erro ao salvar perfil: %v\n", err)
 		return
 	}
-	fmt.Printf("Perfil '%s' salvo com caminho: %s\n", name, absOvpn)
+	fmt.Printf("✅ Perfil '%s' salvo com sucesso!\n", name)
+	fmt.Printf("   📁 Caminho: %s\n", absOvpn)
+	fmt.Printf("   👤 Usuário: %s\n", user)
 }
 
 func handleConnect(args []string) {
@@ -102,8 +107,10 @@ func handleConnect(args []string) {
 	}
 	rest := fs.Args()
 	if len(rest) != 1 {
-		fmt.Println("Uso: gopn connect [flags] <nome_do_perfil>")
+		fmt.Println("❌ Uso: gopn connect [opções] <nome_do_perfil>")
+		fmt.Println("\nOpções disponíveis:")
 		fs.PrintDefaults()
+		fmt.Println("\nExemplo: gopn connect --mfa --verbose trabalho")
 		return
 	}
 	profileName := rest[0]
@@ -116,7 +123,8 @@ func handleConnect(args []string) {
 
 	prof, ok := cfg.Profiles[profileName]
 	if !ok {
-		fmt.Printf("Perfil '%s' não encontrado.\n", profileName)
+		fmt.Printf("❌ Erro: Perfil '%s' não encontrado.\n", profileName)
+		fmt.Println("   Use 'gopn list' para ver os perfis disponíveis.")
 		return
 	}
 
@@ -124,30 +132,28 @@ func handleConnect(args []string) {
 
 	username := prof.Username
 	if *askUser || username == "" {
-		fmt.Print("Usuário: ")
+		fmt.Print("👤 Digite seu usuário: ")
 		u, _ := reader.ReadString('\n')
 		username = strings.TrimSpace(u)
 	} else {
-		fmt.Printf("Usuário: %s (do perfil)\n", username)
+		fmt.Printf("👤 Usuário: %s (salvo no perfil)\n", username)
 	}
 
-	fmt.Print("Senha: ")
+	fmt.Print("🔐 Digite sua senha: ")
 	pwBytes, _ := term.ReadPassword(int(syscall.Stdin))
 	fmt.Println()
 	password := string(pwBytes)
 
 	var mfaCode string
 	if *mfaFlag {
-
-		fmt.Print("Código MFA (6 dígitos, deixe vazio se não houver): ")
+		fmt.Print("🔢 Digite o código MFA (6 dígitos, deixe vazio se não houver): ")
 		txt, _ := reader.ReadString('\n')
 		mfaCode = strings.TrimSpace(txt)
 	} else {
-
-		fmt.Print("Possui MFA (TOTP)? (s/N): ")
+		fmt.Print("🔐 Possui autenticação MFA/2FA? (s/N): ")
 		resp, _ := reader.ReadString('\n')
 		if strings.EqualFold(strings.TrimSpace(resp), "s") {
-			fmt.Print("Código MFA: ")
+			fmt.Print("🔢 Digite o código MFA: ")
 			txt, _ := reader.ReadString('\n')
 			mfaCode = strings.TrimSpace(txt)
 		}
@@ -168,7 +174,8 @@ func handleConnect(args []string) {
 	}
 
 	if err := vpn.Connect(ctx, opt); err != nil {
-		fmt.Printf("Erro durante conexão: %v\n", err)
+		fmt.Printf("❌ Erro durante a conexão VPN: %v\n", err)
+		fmt.Println("   Verifique suas credenciais e tente novamente.")
 	}
 }
 
@@ -178,9 +185,11 @@ func intToDuration(sec int) (d time.Duration) {
 
 func handleDisconnect(args []string) {
 	if len(args) == 0 {
-
+		fmt.Println("🔌 Desconectando todas as sessões VPN...")
 		if err := vpn.DisconnectAll(); err != nil {
-			fmt.Printf("Erro ao desconectar: %v\n", err)
+			fmt.Printf("❌ Erro ao desconectar: %v\n", err)
+		} else {
+			fmt.Println("✅ Todas as conexões VPN foram encerradas.")
 		}
 		return
 	}
@@ -193,47 +202,67 @@ func handleDisconnect(args []string) {
 	}
 	prof, ok := cfg.Profiles[profileName]
 	if !ok {
-		fmt.Printf("Perfil '%s' não encontrado.\n", profileName)
+		fmt.Printf("❌ Erro: Perfil '%s' não encontrado.\n", profileName)
+		fmt.Println("   Use 'gopn list' para ver os perfis disponíveis.")
 		return
 	}
+	fmt.Printf("🔌 Desconectando perfil '%s'...\n", profileName)
 	if err := vpn.DisconnectProfile(prof.OvpnPath); err != nil {
-		fmt.Printf("Erro: %v\n", err)
+		fmt.Printf("❌ Erro ao desconectar: %v\n", err)
+	} else {
+		fmt.Printf("✅ Perfil '%s' desconectado com sucesso.\n", profileName)
 	}
 }
 
 func handleList() {
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Printf("Erro carregando config: %v\n", err)
+		fmt.Printf("❌ Erro ao carregar configuração: %v\n", err)
 		return
 	}
 	if len(cfg.Profiles) == 0 {
-		fmt.Println("Nenhum perfil.")
+		fmt.Println("📋 Nenhum perfil VPN configurado.")
+		fmt.Println("   Use 'gopn add' para adicionar um novo perfil.")
 		return
 	}
-	fmt.Println("Perfis:")
+	fmt.Printf("📋 Perfis VPN configurados (%d encontrados):\n", len(cfg.Profiles))
 	for name, p := range cfg.Profiles {
-		fmt.Printf("  - %s (user=%s, ovpn=%s)\n", name, p.Username, p.OvpnPath)
+		fmt.Printf("  🔹 %s\n", name)
+		fmt.Printf("     👤 Usuário: %s\n", p.Username)
+		fmt.Printf("     📁 Arquivo: %s\n", p.OvpnPath)
+		fmt.Println()
 	}
 }
 
 func printHelp() {
 	helpText := `
-		gopn - Wrapper simplificado para openvpn3
+🔗 GOPN - Gerenciador simplificado para OpenVPN3
 
-		Uso:
-			gopn <comando> [args]
+📖 USO:
+   gopn <comando> [opções] [argumentos]
 
-		Comandos:
-			add <nome> <arquivo.ovpn> <usuario>   Adiciona perfil.
-			connect [flags] <nome>                Conecta usando perfil.
-			disconnect [<nome>]                   Desconecta todas as sessões ou só a do perfil.
-			list                                  Lista perfis.
-			help                                  Ajuda.
+📋 COMANDOS DISPONÍVEIS:
+   add <nome> <arquivo.ovpn> <usuario>   📝 Adiciona um novo perfil VPN
+   connect [opções] <nome>               🔌 Conecta usando um perfil existente  
+   disconnect [<nome>]                   🔌 Desconecta sessões VPN (todas ou específica)
+   list                                  📋 Lista todos os perfis configurados
+   help                                  ❓ Exibe esta ajuda
 
-		Exemplos:
-			gopn disconnect           # Desconecta tudo
-			gopn disconnect corp      # Desconecta somente a sessão do perfil 'corp'
-		`
+🔧 OPÇÕES DO CONNECT:
+   --ask-user      Solicita o nome de usuário mesmo se já estiver salvo
+   --mfa           Força a solicitação do código MFA/2FA
+   --v             Modo verboso (exibe mais detalhes)
+   --timeout <n>   Define timeout em segundos (opcional)
+
+💡 EXEMPLOS:
+   gopn add trabalho /home/user/empresa.ovpn joao.silva
+   gopn connect trabalho
+   gopn connect --mfa --verbose trabalho
+   gopn disconnect                    # Desconecta todas as sessões
+   gopn disconnect trabalho           # Desconecta apenas o perfil 'trabalho'
+   gopn list
+
+📧 Para mais informações, visite: https://github.com/PedroCamargo-dev/gopn
+	`
 	fmt.Print(helpText)
 }
