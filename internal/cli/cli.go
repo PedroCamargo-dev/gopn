@@ -263,6 +263,7 @@ func printHelp() {
    gopn list
 
 📧 Para mais informações, visite: https://github.com/PedroCamargo-dev/gopn
-	`
+	
+`
 	fmt.Print(helpText)
 }
