@@ -23,6 +23,11 @@ type Options struct {
 	Timeout    time.Duration
 }
 
+type SessionInfo struct {
+	Path   string
+	Config string
+}
+
 var sessionPathRegex = regexp.MustCompile(`/net/openvpn/v3/sessions/[a-f0-9\-]+`)
 
 func Connect(ctx context.Context, opt Options) error {
@@ -48,8 +53,9 @@ func Connect(ctx context.Context, opt Options) error {
 
 	outputReader := io.MultiReader(stdout, stderr)
 	doneCh := make(chan error, 1)
+	var sessionPath string
 
-	go processOutput(stdin, outputReader, opt, doneCh)
+	go processOutput(stdin, outputReader, opt, doneCh, &sessionPath)
 
 	if opt.Timeout > 0 {
 		ctx, cancelTimeout := context.WithTimeout(ctx, opt.Timeout)
@@ -74,6 +80,10 @@ func Connect(ctx context.Context, opt Options) error {
 			return fmt.Errorf("erro leitura: %w", rerr)
 		}
 	default:
+	}
+
+	if sessionPath == "" {
+		return errors.New("não foi possível estabelecer a sessão vpn. verifique as credenciais e a conexão")
 	}
 
 	fmt.Println("\n----------------------------------------------------")
@@ -129,7 +139,7 @@ func setupCommand(ctx context.Context, configPath string) (*exec.Cmd, io.WriteCl
 	return cmd, stdin, stdout, stderr, nil
 }
 
-func processOutput(stdin io.WriteCloser, outputReader io.Reader, opt Options, doneCh chan error) {
+func processOutput(stdin io.WriteCloser, outputReader io.Reader, opt Options, doneCh chan error, sessionPath *string) {
 	defer stdin.Close()
 	const windowMax = 512
 	window := make([]byte, 0, windowMax)
@@ -144,6 +154,9 @@ func processOutput(stdin io.WriteCloser, outputReader io.Reader, opt Options, do
 			window = updateWindow(window, chunk, windowMax)
 			winStr := string(window)
 			injectedUser, injectedPass = injectCredentials(stdin, winStr, opt, injectedUser, injectedPass)
+			if match := sessionPathRegex.FindString(winStr); match != "" {
+				*sessionPath = match
+			}
 		}
 		if rerr != nil {
 			if rerr != io.EOF {
@@ -169,21 +182,45 @@ func updateWindow(window, chunk []byte, windowMax int) []byte {
 }
 
 func injectCredentials(stdin io.WriteCloser, winStr string, opt Options, injectedUser, injectedPass bool) (bool, bool) {
-	if !injectedUser && strings.Contains(winStr, "Username:") {
-		if opt.Verbose {
-			fmt.Println("[debug] Injetando username")
-		}
-		_, _ = io.WriteString(stdin, opt.Username+"\n")
-		injectedUser = true
+	lowerWinStr := strings.ToLower(winStr)
+
+	if !injectedUser {
+		injectedUser = tryInjectUsername(stdin, lowerWinStr, opt)
 	}
-	if !injectedPass && strings.Contains(winStr, "Password:") {
-		if opt.Verbose {
-			fmt.Println("[debug] Injetando password (senha+MFA se houver)")
-		}
-		_, _ = io.WriteString(stdin, opt.AuthSecret+"\n")
-		injectedPass = true
+
+	if !injectedPass {
+		injectedPass = tryInjectPassword(stdin, lowerWinStr, opt)
 	}
+
 	return injectedUser, injectedPass
+}
+
+func tryInjectUsername(stdin io.WriteCloser, lowerWinStr string, opt Options) bool {
+	usernamePrompts := []string{"username:", "user name:", "auth user name:"}
+	for _, prompt := range usernamePrompts {
+		if strings.Contains(lowerWinStr, prompt) {
+			if opt.Verbose {
+				fmt.Printf("[debug] Injetando username (detectado: %s)\n", prompt)
+			}
+			_, _ = io.WriteString(stdin, opt.Username+"\n")
+			return true
+		}
+	}
+	return false
+}
+
+func tryInjectPassword(stdin io.WriteCloser, lowerWinStr string, opt Options) bool {
+	passwordPrompts := []string{"password:", "auth password:"}
+	for _, prompt := range passwordPrompts {
+		if strings.Contains(lowerWinStr, prompt) {
+			if opt.Verbose {
+				fmt.Printf("[debug] Injetando password (detectado: %s)\n", prompt)
+			}
+			_, _ = io.WriteString(stdin, opt.AuthSecret+"\n")
+			return true
+		}
+	}
+	return false
 }
 
 func handleTimeout(ctx context.Context, cmd *exec.Cmd) {
@@ -205,33 +242,59 @@ func handleDoneCh(doneCh chan error) {
 }
 
 func zeroBytes(s string) {
-
 	b := []byte(s)
 	for i := range b {
 		b[i] = 0
 	}
 }
 
-func DisconnectAll() error {
+func getSessions() ([]SessionInfo, error) {
 	out, err := exec.Command("openvpn3", "sessions-list").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("erro ao listar sessões: %v\nSaída:\n%s", err, string(out))
+		return nil, fmt.Errorf("erro ao listar sessões: %v\nSaída:\n%s", err, string(out))
 	}
 
-	paths := parseSessionPaths(string(out))
-	if len(paths) == 0 {
+	var sessions []SessionInfo
+	var currentSession SessionInfo
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "Path:") {
+			if currentSession.Path != "" {
+				sessions = append(sessions, currentSession)
+			}
+			currentSession = SessionInfo{Path: strings.TrimSpace(strings.TrimPrefix(line, "Path:"))}
+		} else if strings.HasPrefix(line, "Config:") {
+			currentSession.Config = strings.TrimSpace(strings.TrimPrefix(line, "Config:"))
+		}
+	}
+	if currentSession.Path != "" {
+		sessions = append(sessions, currentSession)
+	}
+
+	return sessions, nil
+}
+
+func DisconnectAll() error {
+	sessions, err := getSessions()
+	if err != nil {
+		return err
+	}
+
+	if len(sessions) == 0 {
 		fmt.Println("Nenhuma sessão ativa encontrada.")
 		return nil
 	}
 
-	fmt.Printf("Encontradas %d sessão(ões). Desconectando...\n", len(paths))
+	fmt.Printf("Encontradas %d sessão(ões). Desconectando...\n", len(sessions))
 	var failures []string
-	for _, p := range paths {
-		cmd := exec.Command("openvpn3", "session-manage", "--session-path", p, "--disconnect")
+	for _, s := range sessions {
+		cmd := exec.Command("openvpn3", "session-manage", "--session-path", s.Path, "--disconnect")
 		if cOut, cErr := cmd.CombinedOutput(); cErr != nil {
-			failures = append(failures, fmt.Sprintf("%s -> %v (%s)", p, cErr, strings.TrimSpace(string(cOut))))
+			failures = append(failures, fmt.Sprintf("%s -> %v (%s)", s.Path, cErr, strings.TrimSpace(string(cOut))))
 		} else {
-			fmt.Printf("✓ Desconectado: %s\n", p)
+			fmt.Printf("✓ Desconectado: %s\n", s.Path)
 		}
 	}
 
@@ -248,70 +311,30 @@ func DisconnectProfile(ovpnPath string) error {
 	if ovpnPath == "" {
 		return errors.New("ovpnPath vazio")
 	}
-	cmd := exec.Command("openvpn3", "session-manage", "--config", ovpnPath, "--disconnect")
+
+	sessions, err := getSessions()
+	if err != nil {
+		return err
+	}
+
+	var sessionToDisconnect string
+	for _, s := range sessions {
+		if s.Config == ovpnPath {
+			sessionToDisconnect = s.Path
+			break
+		}
+	}
+
+	if sessionToDisconnect == "" {
+		return fmt.Errorf("nenhuma sessão ativa associada ao arquivo: %s", ovpnPath)
+	}
+
+	cmd := exec.Command("openvpn3", "session-manage", "--session-path", sessionToDisconnect, "--disconnect")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		txt := string(out)
-
-		if strings.Contains(strings.ToLower(txt), "no such session") ||
-			strings.Contains(strings.ToLower(txt), "not found") {
-			return fmt.Errorf("nenhuma sessão ativa associada ao arquivo: %s", ovpnPath)
-		}
-		return fmt.Errorf("erro ao desconectar perfil (%s): %v\nSaída:\n%s", ovpnPath, err, txt)
+		return fmt.Errorf("erro ao desconectar perfil (%s): %v\nSaída:\n%s", ovpnPath, err, string(out))
 	}
+
 	fmt.Printf("Sessão associada a %s desconectada.\n", ovpnPath)
 	return nil
-}
-
-func parseSessionPaths(output string) []string {
-	var paths []string
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	for scanner.Scan() {
-		line := scanner.Text()
-		paths = appendSessionPathsFromLine(paths, line)
-	}
-	return paths
-}
-
-func appendSessionPathsFromLine(paths []string, line string) []string {
-	if strings.Contains(line, "/net/openvpn/v3/sessions/") {
-		paths = appendMatches(paths, line)
-	} else if isPathLine(line) {
-		paths = appendCandidatePath(paths, line)
-	}
-	return paths
-}
-
-func appendMatches(paths []string, line string) []string {
-	matches := sessionPathRegex.FindAllString(line, -1)
-	for _, m := range matches {
-		if !contains(paths, m) {
-			paths = append(paths, m)
-		}
-	}
-	return paths
-}
-
-func isPathLine(line string) bool {
-	return strings.HasPrefix(strings.TrimSpace(strings.ToLower(line)), "path:")
-}
-
-func appendCandidatePath(paths []string, line string) []string {
-	parts := strings.SplitN(line, ":", 2)
-	if len(parts) == 2 {
-		candidate := strings.TrimSpace(parts[1])
-		if strings.HasPrefix(candidate, "/net/openvpn/v3/sessions/") && !contains(paths, candidate) {
-			paths = append(paths, candidate)
-		}
-	}
-	return paths
-}
-
-func contains(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }

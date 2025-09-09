@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -49,8 +50,14 @@ func handleAdd(args []string) {
 	}
 	name, ovpn, user := args[0], args[1], args[2]
 
-	if _, err := os.Stat(ovpn); errors.Is(err, os.ErrNotExist) {
-		fmt.Printf("Arquivo %s não encontrado.\n", ovpn)
+	absOvpn, err := filepath.Abs(ovpn)
+	if err != nil {
+		fmt.Printf("Erro ao resolver caminho absoluto: %v\n", err)
+		return
+	}
+
+	if _, err := os.Stat(absOvpn); errors.Is(err, os.ErrNotExist) {
+		fmt.Printf("Arquivo %s não encontrado.\n", absOvpn)
 		return
 	}
 
@@ -72,7 +79,7 @@ func handleAdd(args []string) {
 
 	cfg.Profiles[name] = config.Profile{
 		Name:     name,
-		OvpnPath: ovpn,
+		OvpnPath: absOvpn,
 		Username: user,
 	}
 
@@ -80,7 +87,7 @@ func handleAdd(args []string) {
 		fmt.Printf("Erro salvando: %v\n", err)
 		return
 	}
-	fmt.Printf("Perfil '%s' salvo.\n", name)
+	fmt.Printf("Perfil '%s' salvo com caminho: %s\n", name, absOvpn)
 }
 
 func handleConnect(args []string) {
